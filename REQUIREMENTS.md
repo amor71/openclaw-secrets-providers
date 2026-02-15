@@ -324,11 +324,25 @@ src/commands/secrets.vault.test.ts
 - `openclaw secrets rotation disable --provider <name> --secret <s>` — disable rotation
 - Vault: `openclaw secrets lease list` / `openclaw secrets lease renew --lease-id <id>`
 
-### 11.6 Non-Requirements (Rotation)
+### 11.6 Non-Rotatable Secrets
+
+Many API keys are issued by third parties (Alpaca, Anthropic, OpenAI, Brave, etc.) and cannot be programmatically rotated — the provider gives you a static key that lives until you manually regenerate it in their dashboard.
+
+For these secrets:
+
+- **Store & protect** — still keep them in the secrets manager (encrypted, access-controlled, audited). The value of centralized secrets management applies regardless of rotation capability.
+- **`rotation: "manual"` classification** — secrets must be configurable as `rotation: "manual"` so the system does not attempt auto-rotation. This is the default for any secret without explicit rotation config.
+- **Periodic review reminders** — optionally configure a review interval (e.g., `reviewEveryDays: 90`). OpenClaw emits a `secret:review-due` event when the interval elapses, reminding the admin to check if the key should be regenerated.
+- **Expiry tracking** — if the provider supports expiration dates (some API keys have TTLs), track them and emit `secret:expiring-soon` before expiry.
+- **Failure detection** — if an agent receives a 401/403 from an API using a managed secret, emit a `secret:auth-failed` event with the secret name. This doesn't auto-rotate (can't), but alerts the admin that the key may be revoked or expired.
+- **CLI:** `openclaw secrets list --rotation-status` shows each secret's rotation classification (`auto`, `manual`, `dynamic`) and last review/rotation date.
+
+### 11.7 Non-Requirements (Rotation)
 
 - OpenClaw does NOT implement the rotation logic itself — it delegates to provider-native mechanisms
 - OpenClaw does NOT generate new secret values — that is the rotation function's job
 - Rotation setup for Azure requires user-side Azure Function/Logic App creation — OpenClaw provides templates and docs, not a fully automated setup
+- OpenClaw does NOT auto-rotate third-party API keys — it can only remind, detect failures, and alert
 
 ---
 
