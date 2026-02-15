@@ -3,11 +3,14 @@
 > **Status:** Draft for review — no code until sign-off  
 > **Parent PR:** #16663 (GCP Secret Manager)  
 > **Related:** #11539 (akoscz `SecretsProvider` interface)  
+> **Foundation:** [REQUIREMENTS-gcp-secrets.md](https://github.com/amor71/openclaw-contrib/blob/main/REQUIREMENTS-gcp-secrets.md) — the original GCP Secret Manager requirements  
 > **Date:** 2026-02-15
 
 ---
 
 ## 1. Overview
+
+This document extends the original requirements established in [REQUIREMENTS-gcp-secrets.md](https://github.com/amor71/openclaw-contrib/blob/main/REQUIREMENTS-gcp-secrets.md) for the GCP Secret Manager provider. That document defines the core problem statement (§1), goals (§2), functional requirements for storage/retrieval, per-agent isolation, bootstrapping, migration, CLI, error handling, and backward compatibility (§4), user stories (§5), and access model (§6). **All of those requirements remain in force and are not repeated here.** This document covers only what is NEW for the multi-provider expansion.
 
 Extend OpenClaw's secrets infrastructure (established by the GCP Secret Manager PR) with three additional providers:
 
@@ -261,7 +264,72 @@ src/commands/secrets.vault.test.ts
 
 ---
 
-## 11. Non-Functional Requirements
+## 11. Secret Rotation
+
+> The original GCP requirements (§3) listed automatic secret rotation as out of scope. This section brings it in scope for the multi-provider expansion.
+
+### 11.1 Goals
+
+- Secrets should be rotatable without manual intervention or agent downtime
+- When a secret rotates, all agents using it must transparently pick up the new value
+- The caching layer must invalidate stale values on rotation events
+- Rotation must be provider-native — OpenClaw orchestrates, not reimplements
+
+### 11.2 Provider-Specific Rotation Requirements
+
+#### AWS Secrets Manager
+- Support AWS-native rotation via Lambda functions
+- Allow configuring rotation schedule and window via `openclaw secrets rotation` CLI
+- Accept rotation Lambda ARN (built-in templates for RDS/Redshift/DocumentDB or custom)
+- Listen for `SecretRotationSucceeded` / `SecretRotationFailed` CloudWatch events to trigger cache invalidation
+
+#### Azure Key Vault
+- Support event-driven rotation via Event Grid (`SecretNearExpiry`, `SecretExpired` events)
+- Provide guidance and optional CLI setup for wiring events to Azure Functions
+- Less turnkey than AWS — document the required user-side setup clearly
+- On receiving rotation events, invalidate cached value and re-fetch
+
+#### HashiCorp Vault
+- **Dynamic secrets (primary model):** Support Vault's lease-based dynamic secret generation — credentials are short-lived and ephemeral, not rotated
+- Manage lease lifecycle: request → use → renew or let expire → request new
+- Track lease IDs and TTLs; renew leases before expiry when possible
+- **Static secret rotation:** Support Vault's database static role rotation on a configurable schedule
+- On lease expiry or rotation, invalidate cache and obtain fresh credentials
+
+#### GCP Secret Manager
+- GCP does not have built-in rotation. Rotation is handled externally (e.g., Cloud Functions triggered by Cloud Scheduler)
+- Support Pub/Sub notifications on secret version additions to trigger cache invalidation
+- Document the pattern for GCP rotation setup
+
+### 11.3 Cache Invalidation on Rotation
+
+- When a rotation event is detected (via provider-specific mechanism), the corresponding cache entry MUST be invalidated immediately
+- The next access to the rotated secret fetches the new value from the provider
+- If event-based invalidation is not configured, the existing TTL-based cache expiry serves as the fallback
+- Agents must NOT cache rotated-out values beyond one cache TTL cycle
+
+### 11.4 Rotation Event Notifications
+
+- When a secret rotation is detected, emit an internal `secret:rotated` event with `{ provider, secretName, timestamp }`
+- Agents and plugins can subscribe to this event to take action (e.g., reconnect a database, refresh a token)
+- Events are best-effort — missed events fall back to TTL-based refresh
+
+### 11.5 CLI Commands for Rotation
+
+- `openclaw secrets rotation status --provider <name>` — show rotation config for all secrets
+- `openclaw secrets rotation enable --provider <name> --secret <s> [--schedule <cron>] [--lambda-arn <arn>]` — configure rotation (AWS)
+- `openclaw secrets rotation disable --provider <name> --secret <s>` — disable rotation
+- Vault: `openclaw secrets lease list` / `openclaw secrets lease renew --lease-id <id>`
+
+### 11.6 Non-Requirements (Rotation)
+
+- OpenClaw does NOT implement the rotation logic itself — it delegates to provider-native mechanisms
+- OpenClaw does NOT generate new secret values — that is the rotation function's job
+- Rotation setup for Azure requires user-side Azure Function/Logic App creation — OpenClaw provides templates and docs, not a fully automated setup
+
+---
+
+## 12. Non-Functional Requirements
 
 - **No breaking changes:** Existing GCP users are unaffected
 - **Lazy loading:** SDKs loaded only when provider is referenced — zero cost for unused providers

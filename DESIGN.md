@@ -2,7 +2,10 @@
 
 > **Status:** Draft for review — no code until sign-off  
 > **Prereq:** [REQUIREMENTS.md](./REQUIREMENTS.md)  
+> **Foundation:** [REQUIREMENTS-gcp-secrets.md](https://github.com/amor71/openclaw-contrib/blob/main/REQUIREMENTS-gcp-secrets.md) — original GCP requirements  
 > **Date:** 2026-02-15
+
+This design extends the GCP Secret Manager architecture. The original requirements and design patterns (bootstrapping, migration, per-agent isolation, secret references) are established in the [original GCP requirements doc](https://github.com/amor71/openclaw-contrib/blob/main/REQUIREMENTS-gcp-secrets.md) and the GCP implementation in PR #16663. This document covers only the multi-provider expansion and rotation architecture.
 
 ---
 
@@ -414,10 +417,170 @@ Each provider is a standalone PR after the refactor PR. They can be reviewed and
 
 ---
 
-## 12. Open Questions
+## 12. Secret Rotation Architecture
+
+### 12.1 Overview
+
+```
+Provider-native rotation
+        │
+        ▼
+┌──────────────────────┐
+│  Rotation Events     │  ← CloudWatch / Event Grid / Vault lease expiry
+│  (provider-specific) │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  RotationWatcher     │  ← polls or subscribes per provider
+│  (new component)     │
+└──────────┬───────────┘
+           │ invalidates cache + emits event
+           ▼
+┌──────────────────────┐     ┌──────────────────────┐
+│  fetchWithCache()    │     │  EventEmitter         │
+│  (cache invalidated) │     │  "secret:rotated"     │
+└──────────────────────┘     └──────────────────────┘
+```
+
+### 12.2 RotationWatcher Interface
+
+```typescript
+export interface RotationWatcher {
+  provider: string;
+  start(): Promise<void>;       // begin watching for rotation events
+  stop(): Promise<void>;        // stop watching
+  onRotation(cb: (event: SecretRotatedEvent) => void): void;
+}
+
+export interface SecretRotatedEvent {
+  provider: string;
+  secretName: string;
+  newVersion?: string;
+  timestamp: Date;
+}
+```
+
+### 12.3 Provider-Specific Rotation Design
+
+#### AWS — Lambda-based Rotation
+
+- **Setup:** `openclaw secrets rotation enable --provider aws --secret <name> --lambda-arn <arn> --schedule "rate(30 days)"`
+  - Calls `RotateSecretCommand` with `RotationLambdaARN` and `RotationRules`
+- **Watching:** Poll `DescribeSecretCommand` periodically (every `cacheTtlSeconds`) and compare `LastRotatedDate`
+  - Alternative: Subscribe to CloudWatch Events `aws.secretsmanager` / `RotationSucceeded` via EventBridge (requires user setup)
+- **Cache invalidation:** On detected rotation, call `clearSecretCache(provider, secretName)`
+
+#### Azure — Event Grid-driven Rotation
+
+- **Setup:** Provide ARM template / CLI snippet for:
+  1. Event Grid subscription on Key Vault for `SecretNearExpiry` / `SecretExpired`
+  2. Azure Function that performs the rotation and stores new version
+  3. Webhook callback to OpenClaw (or polling-based detection)
+- **Watching:** Poll `getSecret()` version and compare to cached version on each TTL expiry
+  - Full event-driven: optional webhook endpoint (future — requires OpenClaw HTTP server)
+- **Cache invalidation:** On version mismatch, invalidate and re-fetch
+
+#### HashiCorp Vault — Lease Management & Dynamic Secrets
+
+- **Dynamic secrets** are fundamentally different — no rotation, just short-lived credentials:
+
+```typescript
+export interface VaultLeaseManager {
+  requestDynamic(backend: string, role: string): Promise<VaultLease>;
+  renewLease(leaseId: string): Promise<VaultLease>;
+  revokeLease(leaseId: string): Promise<void>;
+  listActiveLeases(): VaultLease[];
+}
+
+export interface VaultLease {
+  leaseId: string;
+  data: Record<string, string>;  // credentials
+  ttl: number;                   // seconds
+  renewable: boolean;
+  expiresAt: Date;
+}
+```
+
+- **Lease lifecycle:**
+  1. Agent requests dynamic credentials → Vault generates ephemeral creds with TTL
+  2. `VaultLeaseManager` tracks the lease, schedules renewal at 2/3 TTL
+  3. If renewal fails or lease expires → request new credentials, invalidate cache
+  4. On shutdown → revoke active leases (best effort)
+
+- **Static rotation:** For database static roles, Vault rotates on its own schedule
+  - Poll `GET /v1/{mount}/static-creds/{role}` and compare `last_vault_rotation`
+  - On change → invalidate cache
+
+- **Secret reference syntax for dynamic secrets:**
+  ```
+  ${vault:database/creds/my-role}       # dynamic — generates new creds
+  ${vault:database/static-creds/role}   # static — auto-rotated by Vault
+  ```
+
+### 12.4 Cache Integration
+
+Extend the existing cache with rotation awareness:
+
+```typescript
+// New function in secret-resolution.ts
+export function invalidateSecret(provider: string, secretName: string): void {
+  const key = `${provider}:${secretName}#latest`;
+  secretCache.delete(key);
+  // Also delete any version-pinned entries for this secret
+  for (const k of secretCache.keys()) {
+    if (k.startsWith(`${provider}:${secretName}#`)) {
+      secretCache.delete(k);
+    }
+  }
+}
+```
+
+The `RotationWatcher` calls `invalidateSecret()` on rotation detection, then emits `secret:rotated` for subscribers.
+
+### 12.5 Configuration
+
+Rotation config per provider in `openclaw.json`:
+
+```jsonc
+{
+  "secrets": {
+    "providers": {
+      "aws": {
+        "region": "us-east-1",
+        "rotation": {
+          "enabled": true,
+          "pollIntervalSeconds": 300  // how often to check for rotations
+        }
+      },
+      "vault": {
+        "address": "http://127.0.0.1:8200",
+        "leaseManagement": {
+          "enabled": true,
+          "renewalBuffer": 0.33  // renew when 1/3 of TTL remains
+        }
+      }
+    }
+  }
+}
+```
+
+### 12.6 Implementation Order
+
+Rotation is implemented after the core providers ship:
+
+1. **Phase 1:** Core providers (AWS, Azure, Vault) — no rotation
+2. **Phase 2:** `RotationWatcher` interface + `invalidateSecret()` + `secret:rotated` event
+3. **Phase 3:** AWS rotation watcher (polling-based)
+4. **Phase 4:** Vault lease manager + dynamic secrets
+5. **Phase 5:** Azure rotation watcher + docs/templates
+
+---
+
+## 13. Open Questions
 
 1. **Vault KV v1 support?** — v1 has no versioning. Proposal: v2 only for now, document.
 2. **AWS SSM Parameter Store?** — Popular alternative to Secrets Manager, cheaper. Defer to separate provider `ssm`?
-3. **Secret rotation hooks?** — AWS has built-in rotation lambdas. Out of scope for v1.
+3. **Secret rotation hooks?** — ✅ Addressed in §12. Phased implementation after core providers.
 4. **`delete` method?** — akoscz's interface has `delete`. Add to our interface? Proposal: yes, add in the refactor PR.
 5. **Multi-field Vault secrets?** — Vault KV stores JSON objects. We extract `.value`. Support `${vault:name.field}` syntax later?
