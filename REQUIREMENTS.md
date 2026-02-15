@@ -297,9 +297,12 @@ src/commands/secrets.vault.test.ts
 - On lease expiry or rotation, invalidate cache and obtain fresh credentials
 
 #### GCP Secret Manager
-- GCP does not have built-in rotation. Rotation is handled externally (e.g., Cloud Functions triggered by Cloud Scheduler)
-- Support Pub/Sub notifications on secret version additions to trigger cache invalidation
-- Document the pattern for GCP rotation setup
+- GCP does not have built-in auto-rotation like AWS. Rotation is user-orchestrated via Cloud Scheduler + Cloud Functions (or equivalent)
+- **Pub/Sub integration:** Support `SECRET_VERSION_ADD` event topic notifications — when a new secret version is created (by rotation or manual update), GCP publishes to a Pub/Sub topic. OpenClaw should subscribe to these events to trigger immediate cache invalidation
+- **Polling fallback:** If Pub/Sub is not configured, fall back to TTL-based cache expiry (existing behavior) — rotated values are picked up after cache TTL expires
+- `openclaw secrets rotation setup --provider gcp` should: create the Pub/Sub topic + subscription, configure Secret Manager notification policies, and document the Cloud Scheduler + Cloud Function pattern for the actual rotation logic
+- Provide a sample Cloud Function template for common rotation patterns (API key regeneration)
+- Our existing TTL + stale-while-revalidate caching already handles the passive case; Pub/Sub adds real-time awareness
 
 ### 11.3 Cache Invalidation on Rotation
 

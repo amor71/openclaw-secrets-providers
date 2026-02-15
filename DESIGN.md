@@ -463,6 +463,19 @@ export interface SecretRotatedEvent {
 
 ### 12.3 Provider-Specific Rotation Design
 
+#### GCP — Pub/Sub-driven Rotation
+
+- **Setup:** `openclaw secrets rotation setup --provider gcp`
+  - Creates a Pub/Sub topic (e.g., `openclaw-secret-rotation`) and subscription
+  - Configures Secret Manager notification policies on managed secrets for `SECRET_VERSION_ADD` events
+  - Documents the Cloud Scheduler + Cloud Function pattern for the actual rotation logic (OpenClaw doesn't generate new values)
+- **Watching:** Subscribe to Pub/Sub topic for `SECRET_VERSION_ADD` events
+  - On event: extract secret name from the notification, invalidate cache entry, fetch latest version
+  - **Polling fallback:** If Pub/Sub is not configured, existing TTL-based cache expiry handles it passively — rotated values picked up after cache TTL
+- **Cache invalidation:** Immediate on Pub/Sub event; TTL-based otherwise
+- **Sample template:** Provide a Cloud Function template for common rotation patterns (e.g., API key regeneration → store new version in Secret Manager)
+- **Advantage:** Our existing stale-while-revalidate caching already handles the passive case; Pub/Sub adds real-time awareness without polling overhead
+
 #### AWS — Lambda-based Rotation
 
 - **Setup:** `openclaw secrets rotation enable --provider aws --secret <name> --lambda-arn <arn> --schedule "rate(30 days)"`
@@ -571,9 +584,10 @@ Rotation is implemented after the core providers ship:
 
 1. **Phase 1:** Core providers (AWS, Azure, Vault) — no rotation
 2. **Phase 2:** `RotationWatcher` interface + `invalidateSecret()` + `secret:rotated` event
-3. **Phase 3:** AWS rotation watcher (polling-based)
-4. **Phase 4:** Vault lease manager + dynamic secrets
-5. **Phase 5:** Azure rotation watcher + docs/templates
+3. **Phase 3:** GCP Pub/Sub rotation watcher (`SECRET_VERSION_ADD` subscription)
+4. **Phase 4:** AWS rotation watcher (polling-based)
+5. **Phase 5:** Vault lease manager + dynamic secrets
+6. **Phase 6:** Azure rotation watcher + docs/templates
 
 ---
 
